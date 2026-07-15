@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cloudflared-ingress-router
+  namespace: cloudflared-ingress-router
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: cloudflared-ingress-router
+rules:
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: cloudflared-ingress-router
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cloudflared-ingress-router
+subjects:
+  - kind: ServiceAccount
+    name: cloudflared-ingress-router
+    namespace: cloudflared-ingress-router
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cloudflared-ingress-router-leader-election
+  namespace: cloudflared-ingress-router
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cloudflared-ingress-router-leader-election
+  namespace: cloudflared-ingress-router
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cloudflared-ingress-router-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: cloudflared-ingress-router
+    namespace: cloudflared-ingress-router

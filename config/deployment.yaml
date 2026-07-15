@@ -1,0 +1,76 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloudflared-ingress-router
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared-ingress-router
+  namespace: cloudflared-ingress-router
+  labels:
+    app.kubernetes.io/name: cloudflared-ingress-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared-ingress-router
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflared-ingress-router
+    spec:
+      serviceAccountName: cloudflared-ingress-router
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: manager
+          image: ghcr.io/windyakin/cloudflared-ingress-router:latest
+          args:
+            - --leader-elect
+            # 環境に合わせて変更してください
+            - --account-id=$(CLOUDFLARE_ACCOUNT_ID)
+            - --tunnel-id=$(CLOUDFLARE_TUNNEL_ID)
+            - --origin-url-https=https://traefik.kube-system.svc.cluster.local:443
+            - --origin-url-http=http://traefik.kube-system.svc.cluster.local:80
+          env:
+            - name: CLOUDFLARE_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-ingress-router
+                  key: accountId
+            - name: CLOUDFLARE_TUNNEL_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-ingress-router
+                  key: tunnelId
+            - name: CLOUDFLARE_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: cloudflared-ingress-router
+                  key: apiToken
+          ports:
+            - name: metrics
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 10m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
