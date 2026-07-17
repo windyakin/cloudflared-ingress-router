@@ -1,0 +1,41 @@
+image:
+  repository: ghcr.io/windyakin/cloudflared-ingress-router
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+cloudflare:
+  accountId: ""
+  tunnelId: ""
+  apiToken: ""
+  existingSecret: ""
+
+controller:
+  annotationPrefix: cloudflared-ingress-router.windyakin.net
+  originUrlHttps: https://traefik.kube-system.svc.cluster.local:443
+  originUrlHttp: http://traefik.kube-system.svc.cluster.local:80
+  resyncInterval: 10m
+  leaderElect: true
+
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 128Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
