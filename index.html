@@ -1,0 +1,302 @@
+<title>cloudflared-ingress-router — Helm Chart Repository</title>
+<style>
+  :root {
+    --bg: #f5f3ef;
+    --surface: #eae7e1;
+    --text: #1c2029;
+    --text-secondary: #5c6170;
+    --accent: #c47a2a;
+    --accent-hover: #a8651e;
+    --code-bg: #e2dfd9;
+    --code-border: #d4d0c8;
+    --link: #b06e22;
+    --divider: #d4d0c8;
+    --icon-filter: none;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1520;
+      --surface: #151e2c;
+      --text: #d8dce4;
+      --text-secondary: #7a8599;
+      --accent: #e8943a;
+      --accent-hover: #f0a854;
+      --code-bg: #111926;
+      --code-border: #1e2a3c;
+      --link: #e8943a;
+      --divider: #1e2a3c;
+      --icon-filter: invert(1) brightness(0.85);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #0e1520;
+    --surface: #151e2c;
+    --text: #d8dce4;
+    --text-secondary: #7a8599;
+    --accent: #e8943a;
+    --accent-hover: #f0a854;
+    --code-bg: #111926;
+    --code-border: #1e2a3c;
+    --link: #e8943a;
+    --divider: #1e2a3c;
+    --icon-filter: invert(1) brightness(0.85);
+  }
+
+  :root[data-theme="light"] {
+    --bg: #f5f3ef;
+    --surface: #eae7e1;
+    --text: #1c2029;
+    --text-secondary: #5c6170;
+    --accent: #c47a2a;
+    --accent-hover: #a8651e;
+    --code-bg: #e2dfd9;
+    --code-border: #d4d0c8;
+    --link: #b06e22;
+    --divider: #d4d0c8;
+    --icon-filter: none;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.6;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 3rem 1.5rem;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  .page {
+    max-width: 38rem;
+    width: 100%;
+  }
+
+  .header {
+    margin-bottom: 2.5rem;
+  }
+
+  .project-name {
+    font-family: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    color: var(--text);
+    line-height: 1.3;
+    text-wrap: balance;
+  }
+
+  .badge {
+    display: inline-block;
+    margin-top: 0.75rem;
+    font-family: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
+    font-size: 0.7rem;
+    font-weight: 500;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    padding: 0.15em 0.5em;
+  }
+
+  .description {
+    margin-top: 1rem;
+    font-size: 0.95rem;
+    color: var(--text-secondary);
+    line-height: 1.65;
+    max-width: 34rem;
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid var(--divider);
+    margin: 2rem 0;
+  }
+
+  .section-label {
+    font-family: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
+    font-size: 0.7rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    margin-bottom: 0.75rem;
+  }
+
+  .code-block {
+    position: relative;
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
+    border-radius: 6px;
+    padding: 1rem 1.25rem;
+    overflow-x: auto;
+  }
+
+  .code-block code {
+    font-family: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
+    font-size: 0.825rem;
+    line-height: 1.7;
+    color: var(--text);
+    white-space: pre;
+  }
+
+  .code-block .copy-btn {
+    position: absolute;
+    top: 0.5rem;
+    right: 0.5rem;
+    background: var(--surface);
+    border: 1px solid var(--code-border);
+    border-radius: 4px;
+    padding: 0.3rem 0.5rem;
+    cursor: pointer;
+    font-family: "SF Mono", "Cascadia Code", "Fira Code", "JetBrains Mono", "Consolas", monospace;
+    font-size: 0.65rem;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-secondary);
+    transition: color 0.15s, border-color 0.15s;
+  }
+
+  .code-block .copy-btn:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .code-block .copy-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+  }
+
+  .code-block .copy-btn.copied {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .install-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    margin-top: 0.75rem;
+  }
+
+  .install-steps .code-block code {
+    display: block;
+  }
+
+  .links {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+  }
+
+  .links a {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.85rem;
+    color: var(--link);
+    text-decoration: none;
+    transition: color 0.15s;
+  }
+
+  .links a:hover {
+    color: var(--accent-hover);
+  }
+
+  .links a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  .links a .arrow {
+    font-size: 0.75rem;
+    transition: transform 0.15s;
+  }
+
+  .links a:hover .arrow {
+    transform: translateX(2px);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .links a:hover .arrow { transform: none; }
+    .code-block .copy-btn { transition: none; }
+    .links a { transition: none; }
+  }
+
+  .footer {
+    margin-top: 3rem;
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    opacity: 0.7;
+  }
+</style>
+
+<main class="page">
+  <header class="header">
+    <h1 class="project-name">cloudflared-ingress-router</h1>
+    <span class="badge">Helm Chart Repository</span>
+    <p class="description">
+      Ingress の annotation から Cloudflare Tunnel の公開設定と DNS レコードを自動管理する Kubernetes コントローラ
+    </p>
+  </header>
+
+  <hr class="divider">
+
+  <section>
+    <p class="section-label">Install</p>
+    <div class="install-steps">
+      <div class="code-block">
+        <button class="copy-btn" data-target="step1" aria-label="Copy command">copy</button>
+        <code id="step1">helm repo add cloudflared-ingress-router \
+  https://windyakin.github.io/cloudflared-ingress-router
+helm repo update</code>
+      </div>
+      <div class="code-block">
+        <button class="copy-btn" data-target="step2" aria-label="Copy command">copy</button>
+        <code id="step2">helm install cloudflared-ingress-router \
+  cloudflared-ingress-router/cloudflared-ingress-router \
+  --namespace cloudflared-ingress-router \
+  --create-namespace</code>
+      </div>
+    </div>
+  </section>
+
+  <hr class="divider">
+
+  <nav class="links">
+    <a href="https://github.com/windyakin/cloudflared-ingress-router">
+      GitHub <span class="arrow" aria-hidden="true">→</span>
+    </a>
+    <a href="https://github.com/windyakin/cloudflared-ingress-router/blob/main/charts/cloudflared-ingress-router/values.yaml">
+      values.yaml <span class="arrow" aria-hidden="true">→</span>
+    </a>
+  </nav>
+
+  <p class="footer">Served via GitHub Pages</p>
+</main>
+
+<script>
+  document.querySelectorAll('.copy-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var code = document.getElementById(btn.getAttribute('data-target'));
+      if (!code) return;
+      navigator.clipboard.writeText(code.textContent).then(function() {
+        btn.textContent = 'copied';
+        btn.classList.add('copied');
+        setTimeout(function() {
+          btn.textContent = 'copy';
+          btn.classList.remove('copied');
+        }, 1500);
+      });
+    });
+  });
+</script>
