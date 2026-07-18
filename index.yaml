@@ -1,0 +1,20 @@
+apiVersion: v1
+entries:
+  cloudflared-ingress-router:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-07-18T00:44:24.365256314Z"
+    description: A Kubernetes controller that manages Cloudflare Tunnel ingress rules
+      and DNS records based on Ingress annotations
+    digest: c3cc122050f2d771f61020bd5cd2121615c1cc59f3b0f4ad2779631d039b10a4
+    home: https://github.com/windyakin/cloudflared-ingress-router
+    maintainers:
+    - name: windyakin
+    name: cloudflared-ingress-router
+    sources:
+    - https://github.com/windyakin/cloudflared-ingress-router
+    type: application
+    urls:
+    - https://windyakin.github.io/cloudflared-ingress-router/cloudflared-ingress-router-0.1.0.tgz
+    version: 0.1.0
+generated: "2026-07-18T00:44:24.364809087Z"
