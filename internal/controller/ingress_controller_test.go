@@ -12,16 +12,21 @@ import (
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	v1alpha1 "github.com/windyakin/cloudflared-ingress-router/internal/api/v1alpha1"
 	"github.com/windyakin/cloudflared-ingress-router/internal/cloudflare"
 )
 
-func newTestReconciler(t *testing.T, objs ...*netv1.Ingress) (*IngressReconciler, *cloudflare.Fake) {
+func newTestReconciler(t *testing.T, objs ...client.Object) (*IngressReconciler, *cloudflare.Fake) {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	builder := fake.NewClientBuilder().WithScheme(scheme)
@@ -149,6 +154,134 @@ func TestReconcileKeepsSharedHostnameOnCleanup(t *testing.T) {
 	runReconcile(t, r)
 
 	if !api.Records["dup.example.com"] {
+		t.Errorf("shared DNS record must survive cleanup: %v", api.Records)
+	}
+}
+
+// --- TunnelRoute reconciler tests ---
+
+func TestReconcilePublishesTunnelRoute(t *testing.T) {
+	tr := makeTunnelRoute("monitoring", "grafana",
+		v1alpha1.TunnelRouteRule{
+			Hostname: "grafana.example.com",
+			Service:  "http://grafana.monitoring.svc:3000",
+		},
+	)
+	r, api := newTestReconciler(t, &tr)
+
+	res := runReconcile(t, r)
+
+	if res.RequeueAfter != 10*time.Minute {
+		t.Errorf("RequeueAfter = %v, want resync interval", res.RequeueAfter)
+	}
+	if api.UpdateCalls != 1 {
+		t.Errorf("UpdateCalls = %d, want 1", api.UpdateCalls)
+	}
+	if len(api.Config.Ingress) != 2 || api.Config.Ingress[0].Hostname != "grafana.example.com" {
+		t.Errorf("tunnel config = %+v", api.Config.Ingress)
+	}
+	if !api.Records["grafana.example.com"] {
+		t.Errorf("DNS record not created: %v", api.Records)
+	}
+
+	var got v1alpha1.TunnelRoute
+	if err := r.Get(context.Background(), types.NamespacedName{Namespace: "monitoring", Name: "grafana"}, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !controllerutil.ContainsFinalizer(&got, FinalizerName) {
+		t.Errorf("finalizer not added: %v", got.Finalizers)
+	}
+}
+
+func TestReconcileTunnelRouteIsIdempotent(t *testing.T) {
+	tr := makeTunnelRoute("default", "api",
+		v1alpha1.TunnelRouteRule{
+			Hostname: "api.example.com",
+			Service:  "http://api.default.svc:8080",
+		},
+	)
+	r, api := newTestReconciler(t, &tr)
+
+	runReconcile(t, r)
+	runReconcile(t, r)
+
+	if api.UpdateCalls != 1 {
+		t.Errorf("UpdateCalls = %d, want 1 (second reconcile must be a no-op)", api.UpdateCalls)
+	}
+}
+
+func TestReconcileCleansUpDeletedTunnelRoute(t *testing.T) {
+	tr := makeTunnelRoute("default", "api",
+		v1alpha1.TunnelRouteRule{
+			Hostname: "api.example.com",
+			Service:  "http://api.default.svc:8080",
+		},
+	)
+	now := metav1.Now()
+	tr.DeletionTimestamp = &now
+	tr.Finalizers = []string{FinalizerName}
+	r, api := newTestReconciler(t, &tr)
+	api.Records["api.example.com"] = true
+	api.Config = cloudflare.TunnelConfig{Ingress: []cloudflare.IngressRule{
+		{Hostname: "api.example.com", Service: "http://api.default.svc:8080"},
+		{Service: "http_status:404"},
+	}}
+
+	runReconcile(t, r)
+
+	if api.Records["api.example.com"] {
+		t.Errorf("DNS record not deleted: %v", api.Records)
+	}
+	if len(api.Config.Ingress) != 1 || api.Config.Ingress[0].Service != "http_status:404" {
+		t.Errorf("tunnel config not reduced to catch-all: %+v", api.Config.Ingress)
+	}
+	var got v1alpha1.TunnelRoute
+	err := r.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "api"}, &got)
+	if err == nil {
+		t.Errorf("tunnelroute still exists with finalizers %v", got.Finalizers)
+	}
+}
+
+func TestReconcileMixedIngressAndTunnelRoute(t *testing.T) {
+	ing := makeIngress("default", "web", map[string]string{"enabled": "true"}, "web.example.com")
+	tr := makeTunnelRoute("monitoring", "grafana",
+		v1alpha1.TunnelRouteRule{
+			Hostname: "grafana.example.com",
+			Service:  "http://grafana.monitoring.svc:3000",
+		},
+	)
+	r, api := newTestReconciler(t, &ing, &tr)
+
+	runReconcile(t, r)
+
+	if api.UpdateCalls != 1 {
+		t.Errorf("UpdateCalls = %d, want 1", api.UpdateCalls)
+	}
+	// grafana + web + catch-all = 3 rules
+	if len(api.Config.Ingress) != 3 {
+		t.Fatalf("expected 3 rules, got %d: %+v", len(api.Config.Ingress), api.Config.Ingress)
+	}
+	if !api.Records["web.example.com"] || !api.Records["grafana.example.com"] {
+		t.Errorf("DNS records = %v", api.Records)
+	}
+}
+
+func TestReconcileKeepsSharedHostnameBetweenKinds(t *testing.T) {
+	ing := makeIngress("default", "app", map[string]string{"enabled": "true"}, "shared.example.com")
+	tr := makeTunnelRoute("default", "app",
+		v1alpha1.TunnelRouteRule{
+			Hostname: "shared.example.com",
+			Service:  "http://other.default.svc:8080",
+		},
+	)
+	now := metav1.Now()
+	tr.DeletionTimestamp = &now
+	tr.Finalizers = []string{FinalizerName}
+	r, api := newTestReconciler(t, &ing, &tr)
+
+	runReconcile(t, r)
+
+	if !api.Records["shared.example.com"] {
 		t.Errorf("shared DNS record must survive cleanup: %v", api.Records)
 	}
 }

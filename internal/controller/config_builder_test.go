@@ -6,6 +6,7 @@ import (
 	netv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	v1alpha1 "github.com/windyakin/cloudflared-ingress-router/internal/api/v1alpha1"
 	"github.com/windyakin/cloudflared-ingress-router/internal/cloudflare"
 )
 
@@ -52,7 +53,7 @@ func TestBuildTunnelConfigDefaults(t *testing.T) {
 	if !res.Config.Equal(want) {
 		t.Errorf("config mismatch:\n got  %+v\n want %+v", res.Config, want)
 	}
-	if res.Hostnames["app.example.com"] == nil {
+	if _, ok := res.Hostnames["app.example.com"]; !ok {
 		t.Errorf("hostname owner not recorded")
 	}
 }
@@ -141,7 +142,7 @@ func TestBuildTunnelConfigHostnameConflict(t *testing.T) {
 		makeIngress("ns1", "earlier", map[string]string{"enabled": "true"}, "dup.example.com"),
 	}, testOpts)
 
-	if owner := res.Hostnames["dup.example.com"]; owner == nil || owner.Namespace != "ns1" {
+	if owner, ok := res.Hostnames["dup.example.com"]; !ok || owner.Namespace != "ns1" {
 		t.Errorf("expected ns1/earlier to win, got %+v", owner)
 	}
 	if len(res.Warnings) != 1 || res.Warnings[0].Reason != "HostnameConflict" {
@@ -191,5 +192,133 @@ func TestIngressHostsDeduplicates(t *testing.T) {
 	hosts := ingressHosts(&ing)
 	if len(hosts) != 2 || hosts[0] != "a.example.com" || hosts[1] != "b.example.com" {
 		t.Errorf("hosts = %v", hosts)
+	}
+}
+
+func makeTunnelRoute(namespace, name string, rules ...v1alpha1.TunnelRouteRule) v1alpha1.TunnelRoute {
+	return v1alpha1.TunnelRoute{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec:       v1alpha1.TunnelRouteSpec{Rules: rules},
+	}
+}
+
+func TestBuildCandidatesFromTunnelRoutes(t *testing.T) {
+	routes := []v1alpha1.TunnelRoute{
+		makeTunnelRoute("monitoring", "grafana",
+			v1alpha1.TunnelRouteRule{
+				Hostname: "grafana.example.com",
+				Service:  "http://grafana.monitoring.svc:3000",
+			},
+			v1alpha1.TunnelRouteRule{
+				Hostname: "prometheus.example.com",
+				Service:  "http://prometheus.monitoring.svc:9090",
+				OriginRequest: &v1alpha1.TunnelRouteOriginRequest{
+					HTTPHostHeader: "prometheus.internal",
+				},
+			},
+		),
+	}
+
+	candidates := BuildCandidatesFromTunnelRoutes(routes)
+
+	if len(candidates) != 2 {
+		t.Fatalf("got %d candidates, want 2", len(candidates))
+	}
+	if candidates[0].rule.Hostname != "grafana.example.com" {
+		t.Errorf("candidate 0 hostname = %q", candidates[0].rule.Hostname)
+	}
+	if candidates[1].rule.OriginRequest == nil || candidates[1].rule.OriginRequest.HTTPHostHeader != "prometheus.internal" {
+		t.Errorf("candidate 1 originRequest mismatch: %+v", candidates[1].rule.OriginRequest)
+	}
+	if candidates[0].source.Kind != "TunnelRoute" {
+		t.Errorf("source kind = %q, want TunnelRoute", candidates[0].source.Kind)
+	}
+}
+
+func TestBuildTunnelConfigFromCandidatesMixed(t *testing.T) {
+	ingresses := []netv1.Ingress{
+		makeIngress("default", "web", map[string]string{"enabled": "true"}, "web.example.com"),
+	}
+	routes := []v1alpha1.TunnelRoute{
+		makeTunnelRoute("monitoring", "grafana",
+			v1alpha1.TunnelRouteRule{
+				Hostname: "grafana.example.com",
+				Service:  "http://grafana.monitoring.svc:3000",
+			},
+		),
+	}
+
+	ingCandidates, warnings := BuildCandidatesFromIngresses(ingresses, testOpts)
+	trCandidates := BuildCandidatesFromTunnelRoutes(routes)
+	res := BuildTunnelConfigFromCandidates(append(ingCandidates, trCandidates...))
+	res.Warnings = append(warnings, res.Warnings...)
+
+	if len(res.Warnings) != 0 {
+		t.Fatalf("unexpected warnings: %+v", res.Warnings)
+	}
+	// grafana + web + catch-all = 3 rules
+	if len(res.Config.Ingress) != 3 {
+		t.Fatalf("expected 3 rules, got %d: %+v", len(res.Config.Ingress), res.Config.Ingress)
+	}
+	// Sorted by hostname
+	if res.Config.Ingress[0].Hostname != "grafana.example.com" {
+		t.Errorf("rule 0 = %q, want grafana.example.com", res.Config.Ingress[0].Hostname)
+	}
+	if res.Config.Ingress[1].Hostname != "web.example.com" {
+		t.Errorf("rule 1 = %q, want web.example.com", res.Config.Ingress[1].Hostname)
+	}
+}
+
+func TestBuildTunnelConfigCrossKindHostnameConflict(t *testing.T) {
+	ingresses := []netv1.Ingress{
+		makeIngress("default", "app", map[string]string{"enabled": "true"}, "dup.example.com"),
+	}
+	routes := []v1alpha1.TunnelRoute{
+		makeTunnelRoute("default", "app",
+			v1alpha1.TunnelRouteRule{
+				Hostname: "dup.example.com",
+				Service:  "http://other.default.svc:8080",
+			},
+		),
+	}
+
+	ingCandidates, _ := BuildCandidatesFromIngresses(ingresses, testOpts)
+	trCandidates := BuildCandidatesFromTunnelRoutes(routes)
+	res := BuildTunnelConfigFromCandidates(append(ingCandidates, trCandidates...))
+
+	// "Ingress" < "TunnelRoute" lexicographically, so Ingress wins
+	if owner, ok := res.Hostnames["dup.example.com"]; !ok || owner.Kind != "Ingress" {
+		t.Errorf("expected Ingress to win, got %+v", owner)
+	}
+	if len(res.Warnings) != 1 || res.Warnings[0].Reason != "HostnameConflict" {
+		t.Errorf("expected one HostnameConflict warning, got %+v", res.Warnings)
+	}
+	// one rule + catch-all
+	if len(res.Config.Ingress) != 2 {
+		t.Errorf("expected 2 rules, got %d", len(res.Config.Ingress))
+	}
+}
+
+func TestBuildTunnelConfigTunnelRouteOnly(t *testing.T) {
+	routes := []v1alpha1.TunnelRoute{
+		makeTunnelRoute("default", "api",
+			v1alpha1.TunnelRouteRule{
+				Hostname: "api.example.com",
+				Service:  "http://api.default.svc:8080",
+			},
+		),
+	}
+
+	candidates := BuildCandidatesFromTunnelRoutes(routes)
+	res := BuildTunnelConfigFromCandidates(candidates)
+
+	if len(res.Config.Ingress) != 2 {
+		t.Fatalf("expected 2 rules (1 + catch-all), got %d", len(res.Config.Ingress))
+	}
+	if res.Config.Ingress[0].Hostname != "api.example.com" {
+		t.Errorf("hostname = %q", res.Config.Ingress[0].Hostname)
+	}
+	if res.Config.Ingress[0].Service != "http://api.default.svc:8080" {
+		t.Errorf("service = %q", res.Config.Ingress[0].Service)
 	}
 }

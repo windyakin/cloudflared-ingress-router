@@ -1,0 +1,57 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: tunnelroutes.cloudflared-ingress-router.windyakin.net
+spec:
+  group: cloudflared-ingress-router.windyakin.net
+  names:
+    kind: TunnelRoute
+    listKind: TunnelRouteList
+    plural: tunnelroutes
+    singular: tunnelroute
+    shortNames:
+      - tr
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required: [rules]
+              properties:
+                rules:
+                  type: array
+                  items:
+                    type: object
+                    required: [hostname, service]
+                    properties:
+                      hostname:
+                        type: string
+                      service:
+                        type: string
+                      originRequest:
+                        type: object
+                        properties:
+                          noTLSVerify:
+                            type: boolean
+                          originServerName:
+                            type: string
+                          httpHostHeader:
+                            type: string
+                          http2Origin:
+                            type: boolean
+                          caPool:
+                            type: string
+            status:
+              type: object
+      additionalPrinterColumns:
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      subresources:
+        status: {}

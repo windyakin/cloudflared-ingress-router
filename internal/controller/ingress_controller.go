@@ -17,21 +17,23 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	v1alpha1 "github.com/windyakin/cloudflared-ingress-router/internal/api/v1alpha1"
 	"github.com/windyakin/cloudflared-ingress-router/internal/cloudflare"
 )
 
-// FinalizerName guards DNS record cleanup when a published Ingress is
-// deleted or opts out. Unlike the annotation prefix it is not configurable,
-// so that changing the prefix does not orphan finalizers.
+// FinalizerName guards DNS record cleanup when a published Ingress or
+// TunnelRoute is deleted or opts out. Unlike the annotation prefix it is
+// not configurable, so that changing the prefix does not orphan finalizers.
 const FinalizerName = "cloudflared-ingress-router.windyakin.net/cleanup"
 
-// aggregateRequest is the synthetic request every Ingress event maps to:
-// the reconciler always rebuilds the whole tunnel configuration from all
-// Ingresses, because the configurations API only supports full replacement.
+// aggregateRequest is the synthetic request every Ingress / TunnelRoute
+// event maps to: the reconciler always rebuilds the whole tunnel
+// configuration from all sources, because the configurations API only
+// supports full replacement.
 var aggregateRequest = reconcile.Request{NamespacedName: types.NamespacedName{Name: "tunnel-configuration"}}
 
-// IngressReconciler aggregates opted-in Ingresses into the Cloudflare
-// Tunnel configuration and the corresponding DNS records.
+// IngressReconciler aggregates opted-in Ingresses and TunnelRoutes into
+// the Cloudflare Tunnel configuration and the corresponding DNS records.
 type IngressReconciler struct {
 	client.Client
 	Recorder       record.EventRecorder
@@ -41,52 +43,89 @@ type IngressReconciler struct {
 }
 
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=cloudflared-ingress-router.windyakin.net,resources=tunnelroutes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	var list netv1.IngressList
-	if err := r.List(ctx, &list); err != nil {
+	// --- Ingresses ---
+	var ingList netv1.IngressList
+	if err := r.List(ctx, &ingList); err != nil {
 		return ctrl.Result{}, fmt.Errorf("list ingresses: %w", err)
 	}
 
-	// Partition into Ingresses that should be published and Ingresses that
-	// still carry our finalizer but should no longer be published (deleted
-	// or opted out) and need DNS cleanup.
-	var active, retiring []*netv1.Ingress
-	for i := range list.Items {
-		ing := &list.Items[i]
+	var activeIngresses, retiringIngresses []*netv1.Ingress
+	for i := range ingList.Items {
+		ing := &ingList.Items[i]
 		enabled := IsEnabled(ing, r.Opts.AnnotationPrefix)
 		deleting := !ing.DeletionTimestamp.IsZero()
 		switch {
 		case enabled && !deleting:
-			active = append(active, ing)
+			activeIngresses = append(activeIngresses, ing)
 		case controllerutil.ContainsFinalizer(ing, FinalizerName):
-			retiring = append(retiring, ing)
+			retiringIngresses = append(retiringIngresses, ing)
 		}
 	}
 
-	activeCopy := make([]netv1.Ingress, len(active))
-	for i, ing := range active {
-		activeCopy[i] = *ing
+	// --- TunnelRoutes ---
+	var trList v1alpha1.TunnelRouteList
+	if err := r.List(ctx, &trList); err != nil {
+		return ctrl.Result{}, fmt.Errorf("list tunnelroutes: %w", err)
 	}
-	res := BuildTunnelConfig(activeCopy, r.Opts)
+
+	var activeTunnelRoutes, retiringTunnelRoutes []*v1alpha1.TunnelRoute
+	for i := range trList.Items {
+		tr := &trList.Items[i]
+		deleting := !tr.DeletionTimestamp.IsZero()
+		switch {
+		case !deleting:
+			activeTunnelRoutes = append(activeTunnelRoutes, tr)
+		case controllerutil.ContainsFinalizer(tr, FinalizerName):
+			retiringTunnelRoutes = append(retiringTunnelRoutes, tr)
+		}
+	}
+
+	// --- Build unified config ---
+	ingCopy := make([]netv1.Ingress, len(activeIngresses))
+	for i, ing := range activeIngresses {
+		ingCopy[i] = *ing
+	}
+	trCopy := make([]v1alpha1.TunnelRoute, len(activeTunnelRoutes))
+	for i, tr := range activeTunnelRoutes {
+		trCopy[i] = *tr
+	}
+
+	ingCandidates, warnings := BuildCandidatesFromIngresses(ingCopy, r.Opts)
+	trCandidates := BuildCandidatesFromTunnelRoutes(trCopy)
+	allCandidates := append(ingCandidates, trCandidates...)
+	res := BuildTunnelConfigFromCandidates(allCandidates)
+	res.Warnings = append(warnings, res.Warnings...)
+
 	for _, w := range res.Warnings {
-		r.Recorder.Event(w.Ingress, corev1.EventTypeWarning, w.Reason, w.Message)
+		r.Recorder.Event(w.Object, corev1.EventTypeWarning, w.Reason, w.Message)
 	}
 
 	var errs []error
 
-	// Make sure every published Ingress carries the finalizer before its
-	// hostname goes live, so deletion can never skip DNS cleanup.
-	for _, ing := range active {
+	// Add finalizers to active Ingresses.
+	for _, ing := range activeIngresses {
 		if controllerutil.ContainsFinalizer(ing, FinalizerName) {
 			continue
 		}
 		controllerutil.AddFinalizer(ing, FinalizerName)
 		if err := r.Update(ctx, ing); err != nil {
 			errs = append(errs, fmt.Errorf("add finalizer to %s: %w", client.ObjectKeyFromObject(ing), err))
+		}
+	}
+	// Add finalizers to active TunnelRoutes.
+	for _, tr := range activeTunnelRoutes {
+		if controllerutil.ContainsFinalizer(tr, FinalizerName) {
+			continue
+		}
+		controllerutil.AddFinalizer(tr, FinalizerName)
+		if err := r.Update(ctx, tr); err != nil {
+			errs = append(errs, fmt.Errorf("add finalizer to %s: %w", client.ObjectKeyFromObject(tr), err))
 		}
 	}
 
@@ -103,15 +142,23 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 
 	for host, owner := range res.Hostnames {
 		if err := r.Cloudflare.EnsureDNSRecord(ctx, host); err != nil {
-			r.Recorder.Event(owner, corev1.EventTypeWarning, "DNSRecordFailed", err.Error())
+			r.Recorder.Event(owner.Object, corev1.EventTypeWarning, "DNSRecordFailed", err.Error())
 			errs = append(errs, fmt.Errorf("ensure DNS record for %s: %w", host, err))
 		}
 	}
 
-	for _, ing := range retiring {
-		if err := r.cleanup(ctx, ing, res.Hostnames); err != nil {
+	// Cleanup retiring Ingresses.
+	for _, ing := range retiringIngresses {
+		if err := r.cleanupHosts(ctx, ing, ingressHosts(ing), res.Hostnames); err != nil {
 			r.Recorder.Event(ing, corev1.EventTypeWarning, "CleanupFailed", err.Error())
 			errs = append(errs, fmt.Errorf("cleanup %s: %w", client.ObjectKeyFromObject(ing), err))
+		}
+	}
+	// Cleanup retiring TunnelRoutes.
+	for _, tr := range retiringTunnelRoutes {
+		if err := r.cleanupHosts(ctx, tr, tunnelRouteHosts(tr), res.Hostnames); err != nil {
+			r.Recorder.Event(tr, corev1.EventTypeWarning, "CleanupFailed", err.Error())
+			errs = append(errs, fmt.Errorf("cleanup %s: %w", client.ObjectKeyFromObject(tr), err))
 		}
 	}
 
@@ -121,10 +168,21 @@ func (r *IngressReconciler) Reconcile(ctx context.Context, _ ctrl.Request) (ctrl
 	return ctrl.Result{RequeueAfter: r.ResyncInterval}, nil
 }
 
-// cleanup removes the DNS records of a retiring Ingress (unless another
-// Ingress still publishes the hostname) and then releases the finalizer.
-func (r *IngressReconciler) cleanup(ctx context.Context, ing *netv1.Ingress, stillDesired map[string]*netv1.Ingress) error {
-	for _, host := range ingressHosts(ing) {
+// tunnelRouteHosts returns the hostnames of a TunnelRoute.
+func tunnelRouteHosts(tr *v1alpha1.TunnelRoute) []string {
+	hosts := make([]string, 0, len(tr.Spec.Rules))
+	for _, r := range tr.Spec.Rules {
+		if r.Hostname != "" {
+			hosts = append(hosts, r.Hostname)
+		}
+	}
+	return hosts
+}
+
+// cleanupHosts removes the DNS records for the given hostnames (unless still
+// desired) and then releases the finalizer from the object.
+func (r *IngressReconciler) cleanupHosts(ctx context.Context, obj client.Object, hosts []string, stillDesired map[string]RouteSource) error {
+	for _, host := range hosts {
 		if _, ok := stillDesired[host]; ok {
 			continue
 		}
@@ -132,17 +190,19 @@ func (r *IngressReconciler) cleanup(ctx context.Context, ing *netv1.Ingress, sti
 			return err
 		}
 	}
-	controllerutil.RemoveFinalizer(ing, FinalizerName)
-	return r.Update(ctx, ing)
+	controllerutil.RemoveFinalizer(obj, FinalizerName)
+	return r.Update(ctx, obj)
 }
 
 func (r *IngressReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	mapToAggregate := handler.EnqueueRequestsFromMapFunc(
+		func(context.Context, client.Object) []reconcile.Request {
+			return []reconcile.Request{aggregateRequest}
+		},
+	)
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("cloudflared-ingress-router").
-		Watches(&netv1.Ingress{}, handler.EnqueueRequestsFromMapFunc(
-			func(context.Context, client.Object) []reconcile.Request {
-				return []reconcile.Request{aggregateRequest}
-			},
-		)).
+		Watches(&netv1.Ingress{}, mapToAggregate).
+		Watches(&v1alpha1.TunnelRoute{}, mapToAggregate).
 		Complete(r)
 }

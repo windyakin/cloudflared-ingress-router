@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
+	v1alpha1 "github.com/windyakin/cloudflared-ingress-router/internal/api/v1alpha1"
 	"github.com/windyakin/cloudflared-ingress-router/internal/cloudflare"
 	"github.com/windyakin/cloudflared-ingress-router/internal/controller"
 )
@@ -24,6 +25,7 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(v1alpha1.AddToScheme(scheme))
 }
 
 func main() {

@@ -6,7 +6,9 @@ import (
 	"strings"
 
 	netv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 
+	v1alpha1 "github.com/windyakin/cloudflared-ingress-router/internal/api/v1alpha1"
 	"github.com/windyakin/cloudflared-ingress-router/internal/cloudflare"
 )
 
@@ -38,19 +40,36 @@ type BuildOptions struct {
 	OriginURLHTTP string
 }
 
-// BuildWarning is a per-Ingress problem found while building the
+// RouteSource identifies the Kubernetes object that produced a routing rule.
+type RouteSource struct {
+	Kind      string
+	Namespace string
+	Name      string
+	Object    runtime.Object
+}
+
+func (s RouteSource) sortKey() string {
+	return s.Kind + "/" + s.Namespace + "/" + s.Name
+}
+
+// candidateRule pairs a routing rule with the source object that produced it.
+type candidateRule struct {
+	source RouteSource
+	rule   cloudflare.IngressRule
+}
+
+// BuildWarning is a per-resource problem found while building the
 // configuration. The reconciler surfaces these as Kubernetes events.
 type BuildWarning struct {
-	Ingress *netv1.Ingress
+	Object  runtime.Object
 	Reason  string
 	Message string
 }
 
-// BuildResult is the outcome of BuildTunnelConfig.
+// BuildResult is the outcome of BuildTunnelConfig / BuildTunnelConfigFromCandidates.
 type BuildResult struct {
-	Config *cloudflare.TunnelConfig
-	// Hostnames maps each published hostname to the Ingress that owns it.
-	Hostnames map[string]*netv1.Ingress
+	Config    *cloudflare.TunnelConfig
+	Hostnames map[string]RouteSource
 	Warnings  []BuildWarning
 }
 
@@ -79,64 +98,122 @@ func ingressHosts(ing *netv1.Ingress) []string {
 }
 
 // BuildTunnelConfig aggregates all opted-in Ingresses into a single desired
-// tunnel configuration. Ingresses are processed in namespace/name order and
-// the first owner of a hostname wins; later claims produce a warning.
-// The returned rule list is sorted by hostname and always ends with the
-// mandatory catch-all rule.
+// tunnel configuration. It delegates to BuildCandidatesFromIngresses and
+// BuildTunnelConfigFromCandidates.
 func BuildTunnelConfig(ingresses []netv1.Ingress, opts BuildOptions) BuildResult {
-	res := BuildResult{
-		Config:    &cloudflare.TunnelConfig{},
-		Hostnames: map[string]*netv1.Ingress{},
-	}
+	candidates, warnings := BuildCandidatesFromIngresses(ingresses, opts)
+	res := BuildTunnelConfigFromCandidates(candidates)
+	res.Warnings = append(warnings, res.Warnings...)
+	return res
+}
 
-	sorted := make([]*netv1.Ingress, 0, len(ingresses))
+// BuildCandidatesFromIngresses converts opted-in Ingresses into candidate
+// rules. Ingresses without the enabled annotation are skipped. Annotation
+// validation warnings are returned alongside the candidates.
+func BuildCandidatesFromIngresses(ingresses []netv1.Ingress, opts BuildOptions) ([]candidateRule, []BuildWarning) {
+	var candidates []candidateRule
+	var warnings []BuildWarning
+
 	for i := range ingresses {
-		if IsEnabled(&ingresses[i], opts.AnnotationPrefix) {
-			sorted = append(sorted, &ingresses[i])
-		}
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].Namespace != sorted[j].Namespace {
-			return sorted[i].Namespace < sorted[j].Namespace
-		}
-		return sorted[i].Name < sorted[j].Name
-	})
-
-	for _, ing := range sorted {
-		service, warn := originService(ing, opts)
-		if warn != nil {
-			res.Warnings = append(res.Warnings, *warn)
+		ing := &ingresses[i]
+		if !IsEnabled(ing, opts.AnnotationPrefix) {
 			continue
 		}
-		originRequest, warns := buildOriginRequest(ing, opts, service)
-		res.Warnings = append(res.Warnings, warns...)
+
+		service, warn := originService(ing, opts)
+		if warn != nil {
+			warnings = append(warnings, *warn)
+			continue
+		}
+		originReq, warns := buildOriginRequest(ing, opts, service)
+		warnings = append(warnings, warns...)
+
+		source := RouteSource{
+			Kind:      "Ingress",
+			Namespace: ing.Namespace,
+			Name:      ing.Name,
+			Object:    ing,
+		}
 
 		for _, host := range ingressHosts(ing) {
-			if owner, taken := res.Hostnames[host]; taken {
-				res.Warnings = append(res.Warnings, BuildWarning{
-					Ingress: ing,
-					Reason:  "HostnameConflict",
-					Message: fmt.Sprintf("hostname %s is already published by Ingress %s/%s; skipping", host, owner.Namespace, owner.Name),
-				})
-				continue
-			}
-			res.Hostnames[host] = ing
 			rule := cloudflare.IngressRule{
 				Hostname: host,
 				Service:  service,
 			}
-			if originRequest != nil {
-				or := *originRequest
-				// Default the expected origin certificate name to the
-				// published hostname so that Traefik (serving per-host
-				// certificates via SNI) passes TLS verification.
+			if originReq != nil {
+				or := *originReq
 				if strings.HasPrefix(service, "https://") && or.OriginServerName == "" && !strings.Contains(host, "*") {
 					or.OriginServerName = host
 				}
 				rule.OriginRequest = &or
 			}
-			res.Config.Ingress = append(res.Config.Ingress, rule)
+			candidates = append(candidates, candidateRule{source: source, rule: rule})
 		}
+	}
+
+	return candidates, warnings
+}
+
+// BuildCandidatesFromTunnelRoutes converts TunnelRoute resources into
+// candidate rules. Every TunnelRoute is active by its existence (no
+// opt-in annotation).
+func BuildCandidatesFromTunnelRoutes(routes []v1alpha1.TunnelRoute) []candidateRule {
+	var candidates []candidateRule
+	for i := range routes {
+		tr := &routes[i]
+		source := RouteSource{
+			Kind:      "TunnelRoute",
+			Namespace: tr.Namespace,
+			Name:      tr.Name,
+			Object:    tr,
+		}
+		for _, r := range tr.Spec.Rules {
+			rule := cloudflare.IngressRule{
+				Hostname: r.Hostname,
+				Service:  r.Service,
+			}
+			if r.OriginRequest != nil {
+				rule.OriginRequest = &cloudflare.OriginRequest{
+					NoTLSVerify:      r.OriginRequest.NoTLSVerify,
+					OriginServerName: r.OriginRequest.OriginServerName,
+					HTTPHostHeader:   r.OriginRequest.HTTPHostHeader,
+					HTTP2Origin:      r.OriginRequest.HTTP2Origin,
+					CAPool:           r.OriginRequest.CAPool,
+				}
+			}
+			candidates = append(candidates, candidateRule{source: source, rule: rule})
+		}
+	}
+	return candidates
+}
+
+// BuildTunnelConfigFromCandidates merges candidate rules from all sources
+// into a single tunnel configuration. Candidates are sorted by
+// Kind/Namespace/Name so the first owner of a hostname wins deterministically.
+// The returned rule list is sorted by hostname and always ends with the
+// mandatory catch-all rule.
+func BuildTunnelConfigFromCandidates(candidates []candidateRule) BuildResult {
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].source.sortKey() < candidates[j].source.sortKey()
+	})
+
+	res := BuildResult{
+		Config:    &cloudflare.TunnelConfig{},
+		Hostnames: map[string]RouteSource{},
+	}
+
+	for _, c := range candidates {
+		host := c.rule.Hostname
+		if owner, taken := res.Hostnames[host]; taken {
+			res.Warnings = append(res.Warnings, BuildWarning{
+				Object:  c.source.Object,
+				Reason:  "HostnameConflict",
+				Message: fmt.Sprintf("hostname %s is already published by %s %s/%s; skipping", host, owner.Kind, owner.Namespace, owner.Name),
+			})
+			continue
+		}
+		res.Hostnames[host] = c.source
+		res.Config.Ingress = append(res.Config.Ingress, c.rule)
 	}
 
 	sort.Slice(res.Config.Ingress, func(i, j int) bool {
@@ -152,7 +229,7 @@ func originService(ing *netv1.Ingress, opts BuildOptions) (string, *BuildWarning
 	if svc, ok := annotation(ing, opts.AnnotationPrefix, annotationOriginService); ok {
 		if !strings.Contains(svc, "://") {
 			return "", &BuildWarning{
-				Ingress: ing,
+				Object: ing,
 				Reason:  "InvalidAnnotation",
 				Message: fmt.Sprintf("%s/%s must be a URL including a scheme (got %q); skipping Ingress", opts.AnnotationPrefix, annotationOriginService, svc),
 			}
@@ -170,7 +247,7 @@ func originService(ing *netv1.Ingress, opts BuildOptions) (string, *BuildWarning
 		return opts.OriginURLHTTP, nil
 	default:
 		return "", &BuildWarning{
-			Ingress: ing,
+			Object: ing,
 			Reason:  "InvalidAnnotation",
 			Message: fmt.Sprintf("%s/%s must be \"http\" or \"https\" (got %q); skipping Ingress", opts.AnnotationPrefix, annotationOriginScheme, scheme),
 		}
@@ -196,7 +273,7 @@ func buildOriginRequest(ing *netv1.Ingress, opts BuildOptions, service string) (
 			return false
 		default:
 			warns = append(warns, BuildWarning{
-				Ingress: ing,
+				Object: ing,
 				Reason:  "InvalidAnnotation",
 				Message: fmt.Sprintf("%s/%s must be \"true\" or \"false\" (got %q); treating as false", opts.AnnotationPrefix, suffix, v),
 			})
