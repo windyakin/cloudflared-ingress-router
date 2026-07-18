@@ -1,4 +1,6 @@
-FROM golang:1.25 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
+ARG TARGETOS
+ARG TARGETARCH
 WORKDIR /workspace
 
 COPY go.mod go.sum ./
@@ -6,7 +8,7 @@ RUN go mod download
 
 COPY cmd/ cmd/
 COPY internal/ internal/
-RUN CGO_ENABLED=0 GOOS=linux go build -a -o cloudflared-ingress-router ./cmd
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -a -o cloudflared-ingress-router ./cmd
 
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /
