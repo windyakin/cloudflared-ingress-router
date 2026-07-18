@@ -31,6 +31,44 @@ HTTP / HTTPS のルーティングは既存の Ingress Controller（Traefik, ngi
 
 ## インストール
 
+### Helm（推奨）
+
+```sh
+helm repo add cloudflared-ingress-router https://windyakin.github.io/cloudflared-ingress-router
+helm repo update
+
+helm install cloudflared-ingress-router cloudflared-ingress-router/cloudflared-ingress-router \
+  --namespace cloudflared-ingress-router --create-namespace \
+  --set cloudflare.accountId=<CLOUDFLARE_ACCOUNT_ID> \
+  --set cloudflare.tunnelId=<TUNNEL_ID> \
+  --set cloudflare.apiToken=<API_TOKEN>
+```
+
+既存の Secret を使う場合は `cloudflare.existingSecret` を指定します。Secret には `accountId`、`tunnelId`、`apiToken` のキーが必要です。
+
+```sh
+helm install cloudflared-ingress-router cloudflared-ingress-router/cloudflared-ingress-router \
+  --namespace cloudflared-ingress-router --create-namespace \
+  --set cloudflare.existingSecret=my-cloudflare-secret
+```
+
+主な values:
+
+| パラメータ | 既定値 | 説明 |
+|---|---|---|
+| `cloudflare.accountId` | (必須) | Cloudflare アカウント ID |
+| `cloudflare.tunnelId` | (必須) | 管理対象のトンネル ID |
+| `cloudflare.apiToken` | (必須) | Cloudflare API トークン |
+| `cloudflare.existingSecret` | `""` | 既存 Secret 名（指定時は上記3つは不要） |
+| `controller.originUrlHttps` | `https://traefik.kube-system.svc.cluster.local:443` | HTTPS 時の既定オリジン |
+| `controller.originUrlHttp` | `http://traefik.kube-system.svc.cluster.local:80` | HTTP 時の既定オリジン |
+| `controller.resyncInterval` | `10m` | 定期リコンサイル間隔 |
+| `controller.leaderElect` | `true` | リーダー選出の有効化 |
+
+すべてのパラメータは [`values.yaml`](charts/cloudflared-ingress-router/values.yaml) を参照してください。
+
+### Kustomize
+
 ```sh
 # Secret を作成
 kubectl create namespace cloudflared-ingress-router
