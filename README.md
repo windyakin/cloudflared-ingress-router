@@ -1,37 +1,45 @@
 # cloudflared-ingress-router
 
-Ingress リソースの annotation および TunnelRoute カスタムリソースを読み取って、Cloudflare Tunnel (cloudflared) の公開設定と DNS レコードを自動管理する Kubernetes カスタムコントローラです。
+A Kubernetes custom controller that automatically manages Cloudflare Tunnel (cloudflared) configuration and DNS records using Ingress annotations and TunnelRoute custom resources.
 
-HTTP / HTTPS のルーティングは既存の Ingress Controller（Traefik, nginx-ingress, Envoy, HAProxy など任意）に集約する構成を想定しています。cloudflared の各ホスト名のオリジンは既定で Traefik の Service を向きますが、`--origin-url-https` / `--origin-url-http` フラグや `origin-service` annotation で任意のバックエンドに差し替えられるため、**Traefik 以外の Ingress Controller や、Ingress Controller を経由しない直接 Service 指定でも動作します**。
+HTTP / HTTPS routing is typically handled by an existing Ingress Controller, such as Traefik, nginx-ingress, Envoy, or HAProxy. By default, cloudflared forwards each hostname to the Traefik Service. You can override this with the `--origin-url-https` / `--origin-url-http` flags or the `origin-service` annotation to **use another Ingress Controller or route directly to a Service**.
 
+```mermaid
+flowchart LR
+    Internet --> Edge["Cloudflare edge"]
+    Edge --> Tunnel["cloudflared"]
+    Tunnel --> IngressController["Ingress Controller"]
+    IngressController --> Services["Backend Services"]
+    Tunnel -->|Direct routing| Services
+
+    Ingress["Ingress with annotations"] -.->|Watch| Controller["cloudflared-ingress-router"]
+    TunnelRoute["TunnelRoute custom resources"] -.->|Watch| Controller
+    Controller -.->|Update tunnel configuration| API["Cloudflare API"]
+    Controller -.->|Create or remove DNS CNAME records| API
+    API -.->|Distribute configuration| Tunnel
 ```
-インターネット → Cloudflare edge → cloudflared → Ingress Controller / Service → 各 Service
-                      ▲
-                      │ ①トンネル設定 PUT / ②DNS CNAME 作成
-              cloudflared-ingress-router ← Ingress (annotation) + TunnelRoute (CRD) を watch
-```
 
-## 動作の仕組み
+## How it works
 
-- annotation `cloudflared-ingress-router.windyakin.net/enabled: "true"` が付いた Ingress の `spec.rules[].host`、および TunnelRoute カスタムリソースの `spec.rules[].hostname` を公開ホスト名として収集します
-- 全対象 Ingress と TunnelRoute を集約して 1 つのトンネル設定（ingress rules + 末尾の catch-all `http_status:404`）を組み立て、[Tunnel configurations API](https://developers.cloudflare.com/api/resources/zero_trust/subresources/tunnels/subresources/cloudflared/subresources/configurations/) に PUT します（remotely-managed tunnel）。**cloudflared の再起動なしで即時反映**されます
-- 各ホスト名について、トンネルへ向く proxied CNAME レコード（`<hostname>` → `<tunnel-id>.cfargotunnel.com`）を作成します
-- Ingress / TunnelRoute の削除・オプトアウト時は finalizer によって DNS レコードとトンネル設定から確実に除去されます。DNS レコードは comment フィールドの管理マーカーで所有権を判定するため、手動や他ツール（external-dns 等）が作ったレコードには触れません
+- Collects public hostnames from `spec.rules[].host` on Ingress resources annotated with `cloudflared-ingress-router.windyakin.net/enabled: "true"`, and from `spec.rules[].hostname` on TunnelRoute custom resources.
+- Combines all eligible Ingress and TunnelRoute resources into a single tunnel configuration, including ingress rules and a final `http_status:404` catch-all rule, and sends it to the [Tunnel configurations API](https://developers.cloudflare.com/api/resources/zero_trust/subresources/tunnels/subresources/cloudflared/subresources/configurations/) with a PUT request. This requires a remotely-managed tunnel. **Changes take effect without restarting cloudflared.**
+- Creates a proxied CNAME record for each hostname, pointing `<hostname>` to `<tunnel-id>.cfargotunnel.com`.
+- Uses finalizers to remove DNS records and tunnel configuration entries when resources are deleted or an Ingress opts out. DNS ownership is tracked through a management marker in the record's comment field, so records created manually or by other tools, such as external-dns, are left untouched.
 
-## 前提条件
+## Prerequisites
 
-- トンネルが **remotely-managed** であること。cloudflared は `cloudflared tunnel run --token <TOKEN>` で起動してください
-  - locally-managed（config.yaml + credentials.json）で運用中の場合は、ダッシュボードまたは API からトンネル設定を remote 管理に移行し、Deployment の起動引数を token 方式に変更する必要があります
-  - なお `cloudflared tunnel run` は config ファイルのホットリロードを行わないため、ConfigMap マウント方式では設定変更を反映できません（本コントローラが API 方式を採る理由です）
-- **トンネルは本コントローラ専有**になります。configurations API は全置換のため、ダッシュボード等でトンネルに加えた手動の Public Hostname 設定は定期リコンサイル（既定 10 分）で上書きされます
-- Cloudflare API Token に以下の権限が必要です
+- A **remotely-managed** tunnel. Start cloudflared with `cloudflared tunnel run --token <TOKEN>`.
+  - If you currently use a locally-managed tunnel (`config.yaml` + `credentials.json`), migrate its configuration to remote management through the dashboard or API, and update the Deployment to use token-based startup.
+  - `cloudflared tunnel run` does not hot-reload configuration files, so mounting a ConfigMap cannot apply configuration changes dynamically. This is why the controller uses the API.
+- **The tunnel must be dedicated to this controller.** The configurations API replaces the entire configuration. Manual Public Hostname settings added through the dashboard or other tools are overwritten during periodic reconciliation (every 10 minutes by default).
+- A Cloudflare API token with the following permissions:
   - Account > Cloudflare Tunnel > Edit
   - Zone > DNS > Edit
   - Zone > Zone > Read
 
-## インストール
+## Installation
 
-### Helm（推奨）
+### Helm (recommended)
 
 ```sh
 helm repo add cloudflared-ingress-router https://windyakin.github.io/cloudflared-ingress-router
@@ -44,7 +52,7 @@ helm install cloudflared-ingress-router cloudflared-ingress-router/cloudflared-i
   --set cloudflare.apiToken=<API_TOKEN>
 ```
 
-既存の Secret を使う場合は `cloudflare.existingSecret` を指定します。Secret には `accountId`、`tunnelId`、`apiToken` のキーが必要です。
+To use an existing Secret, set `cloudflare.existingSecret`. The Secret must contain the keys `accountId`, `tunnelId`, and `apiToken`.
 
 ```sh
 helm install cloudflared-ingress-router cloudflared-ingress-router/cloudflared-ingress-router \
@@ -52,40 +60,40 @@ helm install cloudflared-ingress-router cloudflared-ingress-router/cloudflared-i
   --set cloudflare.existingSecret=my-cloudflare-secret
 ```
 
-主な values:
+Key values:
 
-| パラメータ | 既定値 | 説明 |
+| Parameter | Default | Description |
 |---|---|---|
-| `cloudflare.accountId` | (必須) | Cloudflare アカウント ID |
-| `cloudflare.tunnelId` | (必須) | 管理対象のトンネル ID |
-| `cloudflare.apiToken` | (必須) | Cloudflare API トークン |
-| `cloudflare.existingSecret` | `""` | 既存 Secret 名（指定時は上記3つは不要） |
-| `controller.originUrlHttps` | `https://traefik.kube-system.svc.cluster.local:443` | HTTPS 時の既定オリジン |
-| `controller.originUrlHttp` | `http://traefik.kube-system.svc.cluster.local:80` | HTTP 時の既定オリジン |
-| `controller.resyncInterval` | `10m` | 定期リコンサイル間隔 |
-| `controller.leaderElect` | `true` | リーダー選出の有効化 |
+| `cloudflare.accountId` | (required) | Cloudflare account ID |
+| `cloudflare.tunnelId` | (required) | ID of the tunnel to manage |
+| `cloudflare.apiToken` | (required) | Cloudflare API token |
+| `cloudflare.existingSecret` | `""` | Existing Secret name; replaces the three values above |
+| `controller.originUrlHttps` | `https://traefik.kube-system.svc.cluster.local:443` | Default origin for HTTPS |
+| `controller.originUrlHttp` | `http://traefik.kube-system.svc.cluster.local:80` | Default origin for HTTP |
+| `controller.resyncInterval` | `10m` | Periodic reconciliation interval |
+| `controller.leaderElect` | `true` | Enable leader election |
 
-すべてのパラメータは [`values.yaml`](charts/cloudflared-ingress-router/values.yaml) を参照してください。
+See [`values.yaml`](charts/cloudflared-ingress-router/values.yaml) for all parameters.
 
 ### Kustomize
 
 ```sh
-# Secret を作成
+# Create the Secret
 kubectl create namespace cloudflared-ingress-router
 kubectl -n cloudflared-ingress-router create secret generic cloudflared-ingress-router \
   --from-literal=accountId=<CLOUDFLARE_ACCOUNT_ID> \
   --from-literal=tunnelId=<TUNNEL_ID> \
   --from-literal=apiToken=<API_TOKEN>
 
-# マニフェストを適用（オリジン URL 等は config/deployment.yaml を環境に合わせて編集）
+# Apply the manifests (adjust origin URLs and other settings in config/deployment.yaml)
 kubectl apply -k config/
 ```
 
-## 使い方
+## Usage
 
-### Ingress 経由
+### Using Ingress
 
-既存の Ingress Controller に処理させたまま、annotation を追加するだけです。
+Add an annotation to an Ingress resource while keeping routing handled by your existing Ingress Controller.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -95,7 +103,7 @@ metadata:
   annotations:
     cloudflared-ingress-router.windyakin.net/enabled: "true"
 spec:
-  ingressClassName: traefik  # nginx, envoy 等でも可
+  ingressClassName: traefik  # nginx, envoy, etc. also work
   rules:
     - host: myapp.example.com
       http:
@@ -109,9 +117,9 @@ spec:
                   number: 80
 ```
 
-これだけで `myapp.example.com` の CNAME レコードが作成され、トンネル経由（cloudflared → Ingress Controller → myapp）で公開されます。
+The controller creates a CNAME record for `myapp.example.com` and exposes it through the tunnel: cloudflared → Ingress Controller → myapp.
 
-Ingress Controller を経由せず直接 Service にルーティングしたい場合は、`origin-service` annotation でオリジン URL を個別に指定できます。
+To route directly to a Service, set a custom origin URL with the `origin-service` annotation.
 
 ```yaml
 annotations:
@@ -119,9 +127,9 @@ annotations:
   cloudflared-ingress-router.windyakin.net/origin-service: "http://myapp.default.svc.cluster.local:8080"
 ```
 
-### TunnelRoute（カスタムリソース）
+### Using TunnelRoute (custom resource)
 
-Ingress リソースを作成せずにルーティングルールだけを定義したい場合は、`TunnelRoute` カスタムリソースを使用します。Ingress Controller を経由しない直接ルーティングや、Ingress の spec では表現しにくいバックエンド指定に適しています。
+Use a `TunnelRoute` custom resource to define routing rules without creating an Ingress resource. This is useful for routing directly to Services or specifying backends that are difficult to express in an Ingress spec.
 
 ```yaml
 apiVersion: cloudflared-ingress-router.windyakin.net/v1alpha1
@@ -139,72 +147,72 @@ spec:
         httpHostHeader: prometheus.internal
 ```
 
-TunnelRoute は **作成するだけで有効**になります（Ingress のような `enabled` annotation は不要）。削除すれば DNS レコードとトンネル設定から自動的に除去されます。
+TunnelRoute resources are **enabled as soon as they are created**; no `enabled` annotation is needed. Deleting a TunnelRoute automatically removes its DNS records and tunnel configuration entries.
 
-1 つの TunnelRoute に複数のルールを定義できます。`originRequest` で接続設定をルールごとに指定可能です。
+A single TunnelRoute can define multiple rules. Use `originRequest` to configure connection settings for each rule.
 
-#### TunnelRoute spec リファレンス
+#### TunnelRoute spec reference
 
-| フィールド | 型 | 説明 |
+| Field | Type | Description |
 |---|---|---|
-| `spec.rules` * | `[]object` | ルーティングルールの配列 |
-| `spec.rules[].hostname` * | `string` | 公開ホスト名（例 `app.example.com`、`*.example.com`） |
-| `spec.rules[].service` * | `string` | オリジン URL（例 `http://myapp.default.svc:8080`、`https://myapp.default.svc:443`、`http_status:404`） |
-| `spec.rules[].originRequest` | `object` | 接続設定（省略時は cloudflared 既定値） |
-| `spec.rules[].originRequest.noTLSVerify` | `bool` | オリジン証明書の検証を無効化 |
-| `spec.rules[].originRequest.originServerName` | `string` | オリジン TLS の SNI / 検証名 |
-| `spec.rules[].originRequest.httpHostHeader` | `string` | オリジンへ送る Host ヘッダの上書き |
-| `spec.rules[].originRequest.http2Origin` | `bool` | オリジンへ HTTP/2 で接続 |
-| `spec.rules[].originRequest.caPool` | `string` | オリジン検証用 CA バンドルの cloudflared コンテナ内パス |
+| `spec.rules` * | `[]object` | List of routing rules |
+| `spec.rules[].hostname` * | `string` | Public hostname, e.g. `app.example.com` or `*.example.com` |
+| `spec.rules[].service` * | `string` | Origin URL, e.g. `http://myapp.default.svc:8080`, `https://myapp.default.svc:443`, or `http_status:404` |
+| `spec.rules[].originRequest` | `object` | Connection settings; uses cloudflared defaults when omitted |
+| `spec.rules[].originRequest.noTLSVerify` | `bool` | Disable origin certificate verification |
+| `spec.rules[].originRequest.originServerName` | `string` | TLS SNI and certificate verification name for the origin |
+| `spec.rules[].originRequest.httpHostHeader` | `string` | Override the Host header sent to the origin |
+| `spec.rules[].originRequest.http2Origin` | `bool` | Connect to the origin using HTTP/2 |
+| `spec.rules[].originRequest.caPool` | `string` | Path to the CA bundle for origin verification inside the cloudflared container |
 
-\* は必須フィールド
+\* Required field.
 
-### ホスト名の衝突解決
+### Hostname conflict resolution
 
-同一ホスト名を複数のリソース（Ingress / TunnelRoute）が公開しようとした場合、`Kind/Namespace/Name` の辞書順で先勝ちとなり、負けた側には Warning Event（`HostnameConflict`）が記録されます。`"Ingress"` < `"TunnelRoute"` のため、同じ Namespace・Name であれば Ingress が優先されます。
+If multiple resources (Ingress or TunnelRoute) expose the same hostname, the first resource in lexicographical `Kind/Namespace/Name` order wins. Other resources receive a Warning Event with the reason `HostnameConflict`. Since `"Ingress"` sorts before `"TunnelRoute"`, Ingress resources take precedence over TunnelRoute resources.
 
-### Ingress Annotation リファレンス
+### Ingress annotation reference
 
-prefix: `cloudflared-ingress-router.windyakin.net/`（`--annotation-prefix` で変更可能）
+Prefix: `cloudflared-ingress-router.windyakin.net/` (configurable with `--annotation-prefix`).
 
-| annotation | 既定値 | 説明 |
+| Annotation | Default | Description |
 |---|---|---|
-| `enabled` | - | `"true"` で公開対象にする（オプトイン） |
-| `origin-scheme` | `https` | cloudflared → オリジンの接続スキーム。`http` / `https` |
-| `origin-service` | コントローラの既定オリジン URL | オリジンの完全上書き（例 `http://myapp.default.svc.cluster.local:8080`、Ingress Controller を経由させない場合） |
-| `no-tls-verify` | `false` | オリジン証明書の検証を無効化 |
-| `origin-server-name` | 各ホスト名自身 | オリジン TLS の SNI / 検証名。既定でホスト名が渡るため、SNI ベースで証明書を返すオリジン（Traefik 等）で正しく検証されます |
-| `http-host-header` | (未設定) | オリジンへ送る Host ヘッダの上書き |
-| `http2-origin` | `false` | オリジンへ HTTP/2 で接続 |
-| `ca-pool` | (未設定) | オリジン検証用 CA バンドルの **cloudflared コンテナ内パス**。証明書自体は cloudflared Pod に Secret 等でマウントしておく必要があります |
+| `enabled` | - | Set to `"true"` to expose the Ingress (opt-in) |
+| `origin-scheme` | `https` | Connection scheme from cloudflared to the origin: `http` or `https` |
+| `origin-service` | Controller's default origin URL | Override the origin entirely, e.g. `http://myapp.default.svc.cluster.local:8080` to bypass the Ingress Controller |
+| `no-tls-verify` | `false` | Disable origin certificate verification |
+| `origin-server-name` | The hostname itself | TLS SNI and certificate verification name for the origin. Defaults to the public hostname, allowing certificate verification for origins that select certificates using SNI, such as Traefik |
+| `http-host-header` | (unset) | Override the Host header sent to the origin |
+| `http2-origin` | `false` | Connect to the origin using HTTP/2 |
+| `ca-pool` | (unset) | **Path inside the cloudflared container** to the CA bundle for origin verification. Mount the certificates into the cloudflared Pod using a Secret or another volume source |
 
-- 公開ホスト名は annotation ではなく `spec.rules[].host` から取得します（Ingress Controller のルーティング定義と共有）
-- ワイルドカードホスト（`*.example.com`）も公開できますが、既定の `origin-server-name` は付与されません。オリジンが HTTPS の場合は `origin-server-name` を明示するか `no-tls-verify: "true"` を指定してください
+- Public hostnames come from `spec.rules[].host`, sharing the Ingress Controller's routing definition.
+- Wildcard hostnames (`*.example.com`) are supported, but do not receive a default `origin-server-name`. For HTTPS origins, explicitly set `origin-server-name` or use `no-tls-verify: "true"`.
 
-## コントローラのフラグ
+## Controller flags
 
-| flag | 既定値 | 説明 |
+| Flag | Default | Description |
 |---|---|---|
-| `--account-id` | (必須) | Cloudflare アカウント ID |
-| `--tunnel-id` | (必須) | 管理対象のトンネル ID |
-| `--annotation-prefix` | `cloudflared-ingress-router.windyakin.net` | annotation のドメイン部 |
-| `--origin-url-https` | `https://traefik.kube-system.svc.cluster.local:443` | `origin-scheme: https` 時の既定オリジン。環境の Ingress Controller に合わせて変更してください |
-| `--origin-url-http` | `http://traefik.kube-system.svc.cluster.local:80` | `origin-scheme: http` 時の既定オリジン。同上 |
-| `--resync-interval` | `10m` | ドリフト矯正のための定期リコンサイル間隔 |
-| `--leader-elect` | `false` | リーダー選出の有効化 |
+| `--account-id` | (required) | Cloudflare account ID |
+| `--tunnel-id` | (required) | ID of the tunnel to manage |
+| `--annotation-prefix` | `cloudflared-ingress-router.windyakin.net` | Domain portion of the annotation prefix |
+| `--origin-url-https` | `https://traefik.kube-system.svc.cluster.local:443` | Default origin for `origin-scheme: https`; adjust this for your Ingress Controller |
+| `--origin-url-http` | `http://traefik.kube-system.svc.cluster.local:80` | Default origin for `origin-scheme: http`; adjust this for your Ingress Controller |
+| `--resync-interval` | `10m` | Periodic reconciliation interval for correcting drift |
+| `--leader-elect` | `false` | Enable leader election |
 
-API トークンは環境変数 `CLOUDFLARE_API_TOKEN` で渡します。
+Pass the API token through the `CLOUDFLARE_API_TOKEN` environment variable.
 
-## 既知の制約
+## Known limitations
 
-- cloudflared のレプリカを増やした直後、新レプリカが設定を受け取るまでの数秒間 503 を返すことがあります（[cloudflared#1171](https://github.com/cloudflare/cloudflared/issues/1171)）
-- ゾーン一覧はコントローラ起動時にキャッシュされます。Cloudflare アカウントにゾーンを追加した場合はコントローラを再起動してください
-- 1 トンネルあたりの cloudflared 接続上限は 100（= 25 レプリカ）です
+- Immediately after scaling up cloudflared, new replicas may return 503 responses for a few seconds until they receive the configuration ([cloudflared#1171](https://github.com/cloudflare/cloudflared/issues/1171)).
+- The zone list is cached when the controller starts. Restart the controller after adding zones to your Cloudflare account.
+- Each tunnel supports up to 100 cloudflared connections (25 replicas).
 
-## 開発
+## Development
 
 ```sh
-make test          # go test
-make build         # bin/cloudflared-ingress-router
-make docker-build  # コンテナイメージのビルド
+make test          # Run Go tests
+make build         # Build bin/cloudflared-ingress-router
+make docker-build  # Build the container image
 ```
