@@ -1,6 +1,6 @@
 module github.com/windyakin/cloudflared-ingress-router
 
-go 1.26.0
+go 1.26.10
 
 require (
 	github.com/cloudflare/cloudflare-go/v7 v7.7.0
